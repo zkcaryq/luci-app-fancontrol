@@ -96,6 +96,23 @@ sh /tmp/install-fancontrol.sh
 安装脚本不会改软件源、不会执行 `apk upgrade`、不会重启整机、不会覆盖已有
 `/etc/config/fancontrol`。脚本会把被替换的同名文件备份到 `/tmp`。
 
+### Releases APK
+
+本仓库带 GitHub Actions 自动构建流程。每次 `main` 分支更新后，会使用
+ImmortalWrt 25.12 `mediatek/filogic` SDK 构建标准 `.apk` 包，并上传到
+`continuous` 预发布 Release；以后打 `v*` 标签时，会生成对应的正式 Release。
+
+如果你想使用受 `apk` 数据库管理的安装方式，可以从 Releases 页面下载 `.apk`，
+或在路由器上安装滚动构建包：
+
+```sh
+wget -O /tmp/luci-app-fancontrol.apk https://github.com/zkcaryq/luci-app-fancontrol/releases/download/continuous/luci-app-fancontrol_latest_all.apk
+apk add /tmp/luci-app-fancontrol.apk
+```
+
+滚动构建包跟随 `main` 分支，适合尝鲜；长期稳定使用建议优先选择带版本号的
+正式 Release。
+
 ### SDK 构建
 
 把本包放入 OpenWrt / ImmortalWrt package feed 或 package tree 后，使用常规

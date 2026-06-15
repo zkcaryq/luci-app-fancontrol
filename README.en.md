@@ -103,6 +103,24 @@ The install script does not change package feeds, does not run `apk upgrade`,
 does not reboot the router, and does not overwrite an existing
 `/etc/config/fancontrol`. Replaced package files are backed up under `/tmp`.
 
+### Releases APK
+
+This repository includes a GitHub Actions build workflow. Every push to `main`
+builds a standard `.apk` package with the ImmortalWrt 25.12 `mediatek/filogic`
+SDK and uploads it to the `continuous` prerelease. Future `v*` tags create fixed
+versioned releases.
+
+If you prefer an install that is tracked by the `apk` package database, download
+the `.apk` from Releases, or install the rolling build directly on the router:
+
+```sh
+wget -O /tmp/luci-app-fancontrol.apk https://github.com/zkcaryq/luci-app-fancontrol/releases/download/continuous/luci-app-fancontrol_latest_all.apk
+apk add /tmp/luci-app-fancontrol.apk
+```
+
+The rolling build follows the `main` branch and is best for early testing. For
+long-term stable use, prefer a versioned Release when available.
+
 ### SDK Build
 
 Place this package under an OpenWrt / ImmortalWrt package feed or package tree,
