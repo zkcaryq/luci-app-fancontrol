@@ -1,0 +1,979 @@
+#!/bin/sh
+
+CONFIG="fancontrol"
+SECTION="settings"
+PIDFILE="/var/run/fancontrol.pid"
+STATEFILE="/var/run/fancontrol.state"
+HEARTBEAT="/var/run/fancontrol.heartbeat"
+
+AUTO_START_LOW=65000
+AUTO_START_MED=72000
+AUTO_START_HIGH=79000
+AUTO_START_FULL=86000
+AUTO_DROP_OFF=60000
+AUTO_DROP_LOW=68000
+AUTO_DROP_MED=75000
+AUTO_DROP_HIGH=82000
+AUTO_HOLD_OFF=60
+AUTO_HOLD_LOW=45
+AUTO_HOLD_MED=45
+AUTO_HOLD_HIGH=30
+AUTO_MIN_RUN=60
+DEFAULT_INTERVAL=3
+DEFAULT_RPM_MAX=6500
+KICK_SECONDS=1
+STARTUP_GRACE=9
+BAD_RPM_LIMIT=3
+RPM_FLOOR_LOW=500
+RPM_FLOOR_MED=700
+RPM_FLOOR_HIGH=900
+RPM_FLOOR_FULL=1000
+WATCHDOG_INTERVAL=10
+WATCHDOG_STALE=12
+
+level="off"
+target_percent="0"
+last_change="0"
+last_start="0"
+pending_level=""
+pending_since="0"
+temp_a=""
+temp_b=""
+temp_c=""
+smoothed_temp=""
+spinup_until="0"
+bad_rpm_count="0"
+rpm_observed_max="0"
+reason="初始化"
+fault="0"
+
+log_msg() {
+	[ -e /tmp/fancontrol.debug ] || [ "$(uci_get debug_log 0)" = "1" ] || return 0
+	logger -t fancontrol "$*"
+}
+
+set_oom_score() {
+	[ -w "/proc/$$/oom_score_adj" ] && printf '%s\n' "$1" > "/proc/$$/oom_score_adj" 2>/dev/null || true
+}
+
+uci_get() {
+	local key="$1"
+	local fallback="$2"
+	local value
+
+	value="$(uci -q get "$CONFIG.$SECTION.$key" 2>/dev/null)"
+	[ -n "$value" ] && printf '%s' "$value" || printf '%s' "$fallback"
+}
+
+is_uint() {
+	case "$1" in
+		''|*[!0-9]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+clamp() {
+	local value="$1"
+	local min="$2"
+	local max="$3"
+
+	is_uint "$value" || value="$min"
+	[ "$value" -lt "$min" ] && value="$min"
+	[ "$value" -gt "$max" ] && value="$max"
+	printf '%s' "$value"
+}
+
+now() {
+	date +%s
+}
+
+read_file() {
+	[ -r "$1" ] && cat "$1" 2>/dev/null
+}
+
+write_file() {
+	[ -w "$1" ] || return 1
+	printf '%s\n' "$2" > "$1" 2>/dev/null
+}
+
+find_hwmon_by_name() {
+	local wanted="$1"
+	local dir name
+
+	for dir in /sys/class/hwmon/hwmon*; do
+		[ -d "$dir" ] || continue
+		name="$(read_file "$dir/name")"
+		[ "$name" = "$wanted" ] && {
+			printf '%s' "$dir"
+			return 0
+		}
+	done
+
+	return 1
+}
+
+cpu_temp_path() {
+	local dir
+
+	dir="$(find_hwmon_by_name cpu_thermal)"
+	[ -n "$dir" ] && [ -r "$dir/temp1_input" ] && {
+		printf '%s' "$dir/temp1_input"
+		return
+	}
+
+	[ -r /sys/class/thermal/thermal_zone0/temp ] && {
+		printf '%s' /sys/class/thermal/thermal_zone0/temp
+		return
+	}
+
+	for dir in /sys/class/thermal/thermal_zone*; do
+		[ -r "$dir/temp" ] && {
+			printf '%s' "$dir/temp"
+			return
+		}
+	done
+}
+
+temp_by_hwmon_name() {
+	local wanted="$1"
+	local dir
+
+	dir="$(find_hwmon_by_name "$wanted")"
+	[ -n "$dir" ] && [ -r "$dir/temp1_input" ] && read_file "$dir/temp1_input"
+}
+
+fan_hwmon_dir() {
+	local dir
+
+	dir="$(find_hwmon_by_name pwmfan)"
+	[ -n "$dir" ] && [ -e "$dir/pwm1" ] && {
+		printf '%s' "$dir"
+		return
+	}
+
+	for dir in /sys/class/hwmon/hwmon*; do
+		[ -e "$dir/pwm1" ] && [ -e "$dir/fan1_input" ] && {
+			printf '%s' "$dir"
+			return
+		}
+	done
+}
+
+pwm_path() {
+	local dir
+	dir="$(fan_hwmon_dir)"
+	[ -n "$dir" ] && printf '%s' "$dir/pwm1"
+}
+
+pwm_enable_path() {
+	local dir
+	dir="$(fan_hwmon_dir)"
+	[ -n "$dir" ] && [ -e "$dir/pwm1_enable" ] && printf '%s' "$dir/pwm1_enable"
+}
+
+rpm_path() {
+	local dir
+	dir="$(fan_hwmon_dir)"
+	[ -n "$dir" ] && [ -e "$dir/fan1_input" ] && printf '%s' "$dir/fan1_input"
+}
+
+thermal_policy_path() {
+	local dir type
+
+	for dir in /sys/class/thermal/thermal_zone*; do
+		[ -r "$dir/type" ] || continue
+		type="$(read_file "$dir/type")"
+		[ "$type" = "cpu-thermal" ] && [ -w "$dir/policy" ] && {
+			printf '%s' "$dir/policy"
+			return
+		}
+	done
+
+	[ -w /sys/class/thermal/thermal_zone0/policy ] && printf '%s' /sys/class/thermal/thermal_zone0/policy
+}
+
+cooling_state_path() {
+	local dir type
+
+	for dir in /sys/class/thermal/cooling_device*; do
+		[ -r "$dir/type" ] || continue
+		type="$(read_file "$dir/type")"
+		[ "$type" = "pwm-fan" ] && {
+			printf '%s' "$dir/cur_state"
+			return
+		}
+	done
+}
+
+percent_to_pwm() {
+	local percent
+
+	percent="$(clamp "$1" 0 100)"
+	[ "$percent" -eq 100 ] && {
+		printf '255'
+		return
+	}
+
+	printf '%s' $(((percent * 255 + 50) / 100))
+}
+
+pwm_to_percent() {
+	local pwm="$1"
+
+	is_uint "$pwm" || {
+		printf 'null'
+		return
+	}
+
+	[ "$pwm" -gt 255 ] && pwm=255
+	printf '%s' $(((pwm * 100 + 127) / 255))
+}
+
+percent_for_level() {
+	case "$1" in
+		low) printf '50' ;;
+		medium) printf '70' ;;
+		high) printf '85' ;;
+		full|fault) printf '100' ;;
+		*) printf '0' ;;
+	esac
+}
+
+label_for_level() {
+	case "$1" in
+		starting) printf '启动确认中' ;;
+		low) printf '低速散热' ;;
+		medium) printf '中速散热' ;;
+		high) printf '高速散热' ;;
+		full) printf '满速保护' ;;
+		fixed) printf '固定风力' ;;
+		fault) printf '异常保护' ;;
+		*) printf '停止' ;;
+	esac
+}
+
+rpm_floor_for_level() {
+	local current_level="$1"
+	local percent="$2"
+
+	case "$current_level" in
+		low) printf '%s' "$RPM_FLOOR_LOW" ;;
+		medium) printf '%s' "$RPM_FLOOR_MED" ;;
+		high) printf '%s' "$RPM_FLOOR_HIGH" ;;
+		full|fault) printf '%s' "$RPM_FLOOR_FULL" ;;
+		fixed)
+			percent="$(clamp "$percent" 50 100)"
+			if [ "$percent" -ge 100 ]; then
+				printf '%s' "$RPM_FLOOR_FULL"
+			elif [ "$percent" -ge 85 ]; then
+				printf '%s' "$RPM_FLOOR_HIGH"
+			elif [ "$percent" -ge 70 ]; then
+				printf '%s' "$RPM_FLOOR_MED"
+			else
+				printf '%s' "$RPM_FLOOR_LOW"
+			fi
+			;;
+		*) printf '0' ;;
+	esac
+}
+
+update_rpm_observed() {
+	local rpm="$1"
+
+	is_uint "$rpm" || return 1
+	[ "$rpm" -gt "$rpm_observed_max" ] && rpm_observed_max="$rpm"
+	return 0
+}
+
+rpm_display_max() {
+	local rpm="$1"
+	local max="$DEFAULT_RPM_MAX"
+
+	is_uint "$rpm_observed_max" && [ "$rpm_observed_max" -gt "$max" ] && max="$rpm_observed_max"
+	is_uint "$rpm" && [ "$rpm" -gt "$max" ] && max="$rpm"
+	printf '%s' "$max"
+}
+
+rpm_max_source() {
+	local max="$1"
+
+	if [ "$max" -gt "$DEFAULT_RPM_MAX" ]; then
+		printf 'observed'
+	else
+		printf 'estimated'
+	fi
+}
+
+rpm_percent_of_max() {
+	local rpm="$1"
+	local max="$2"
+
+	if ! is_uint "$rpm" || ! is_uint "$max" || [ "$max" -le 0 ]; then
+		printf 'null'
+		return
+	fi
+
+	[ "$rpm" -gt "$max" ] && rpm="$max"
+	printf '%s' $(((rpm * 100 + max / 2) / max))
+}
+
+set_manual_control() {
+	local path
+
+	path="$(thermal_policy_path)"
+	[ -n "$path" ] && write_file "$path" user_space || true
+
+	path="$(pwm_enable_path)"
+	[ -n "$path" ] && write_file "$path" 1 || true
+}
+
+restore_system() {
+	local path state
+
+	path="$(thermal_policy_path)"
+	[ -n "$path" ] && write_file "$path" step_wise || true
+
+	path="$(cooling_state_path)"
+	state="$(read_file "$path")"
+	[ -n "$path" ] && is_uint "$state" && write_file "$path" "$state" || true
+
+	rm -f "$PIDFILE" "$STATEFILE" "$HEARTBEAT"
+}
+
+set_fan_percent_raw() {
+	local percent="$1"
+	local pwm path
+
+	percent="$(clamp "$percent" 0 100)"
+	pwm="$(percent_to_pwm "$percent")"
+	path="$(pwm_path)"
+
+	set_manual_control
+	[ -n "$path" ] && write_file "$path" "$pwm"
+}
+
+heartbeat() {
+	printf '%s\n' "$(now)" > "$HEARTBEAT" 2>/dev/null || true
+}
+
+load_state() {
+	[ -r "$STATEFILE" ] && . "$STATEFILE" 2>/dev/null || true
+	level="${level:-off}"
+	target_percent="$(clamp "${target_percent:-0}" 0 100)"
+	last_change="$(clamp "${last_change:-0}" 0 2147483647)"
+	last_start="$(clamp "${last_start:-0}" 0 2147483647)"
+	pending_level="${pending_level:-}"
+	pending_since="$(clamp "${pending_since:-0}" 0 2147483647)"
+	temp_a="${temp_a:-}"
+	temp_b="${temp_b:-}"
+	temp_c="${temp_c:-}"
+	smoothed_temp="${smoothed_temp:-}"
+	spinup_until="$(clamp "${spinup_until:-0}" 0 2147483647)"
+	bad_rpm_count="$(clamp "${bad_rpm_count:-0}" 0 100)"
+	rpm_observed_max="$(clamp "${rpm_observed_max:-0}" 0 99999)"
+	reason="${reason:-初始化}"
+	fault="$(clamp "${fault:-0}" 0 1)"
+}
+
+save_state() {
+	local tmp="${STATEFILE}.$$"
+
+	{
+		printf "level='%s'\n" "$level"
+		printf "target_percent='%s'\n" "$target_percent"
+		printf "last_change='%s'\n" "$last_change"
+		printf "last_start='%s'\n" "$last_start"
+		printf "pending_level='%s'\n" "$pending_level"
+		printf "pending_since='%s'\n" "$pending_since"
+		printf "temp_a='%s'\n" "$temp_a"
+		printf "temp_b='%s'\n" "$temp_b"
+		printf "temp_c='%s'\n" "$temp_c"
+		printf "smoothed_temp='%s'\n" "$smoothed_temp"
+		printf "spinup_until='%s'\n" "$spinup_until"
+		printf "bad_rpm_count='%s'\n" "$bad_rpm_count"
+		printf "rpm_observed_max='%s'\n" "$rpm_observed_max"
+		printf "reason='%s'\n" "$reason"
+		printf "fault='%s'\n" "$fault"
+	} > "$tmp"
+	mv "$tmp" "$STATEFILE"
+}
+
+smooth_temp() {
+	local temp="$1"
+	local sum=0
+	local count=0
+	local t
+
+	is_uint "$temp" || return 1
+
+	temp_c="$temp_b"
+	temp_b="$temp_a"
+	temp_a="$temp"
+
+	for t in "$temp_a" "$temp_b" "$temp_c"; do
+		if is_uint "$t"; then
+			sum=$((sum + t))
+			count=$((count + 1))
+		fi
+	done
+
+	[ "$count" -gt 0 ] || return 1
+	smoothed_temp=$((sum / count))
+	printf '%s' "$smoothed_temp"
+}
+
+service_running() {
+	local pid
+
+	pid="$(read_file "$PIDFILE")"
+	[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+json_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+json_num() {
+	case "$1" in
+		''|*[!0-9-]*) printf 'null' ;;
+		*) printf '%s' "$1" ;;
+	esac
+}
+
+json_field() {
+	[ "$_json_first" = 0 ] && printf ','
+	_json_first=0
+	printf '"%s":%s' "$1" "$2"
+}
+
+json_string() {
+	printf '"%s"' "$(json_escape "$1")"
+}
+
+read_trip_temp() {
+	local idx="$1"
+	read_file "/sys/class/thermal/thermal_zone0/trip_point_${idx}_temp"
+}
+
+print_status() {
+	local mode interval fixed_percent temp_path fan_dir pp rp policy_path cooling_path
+	local raw_temp display_temp wifi0 wifi1 eth_temp rpm pwm percent policy cooling running hardware_ready state_label
+	local rpm_max rpm_percent rpm_source
+	local dt_low dt_med dt_high dt_full hb hb_age ts
+
+	mode="$(uci_get mode system)"
+	interval="$(clamp "$(uci_get interval "$DEFAULT_INTERVAL")" 1 60)"
+	fixed_percent="$(clamp "$(uci_get fixed_percent "$(uci_get fan_percent 70)")" 0 100)"
+
+	load_state
+	temp_path="$(cpu_temp_path)"
+	fan_dir="$(fan_hwmon_dir)"
+	pp="$(pwm_path)"
+	rp="$(rpm_path)"
+	policy_path="$(thermal_policy_path)"
+	cooling_path="$(cooling_state_path)"
+
+	raw_temp="$(read_file "$temp_path")"
+	display_temp="$raw_temp"
+	is_uint "$display_temp" || display_temp="$smoothed_temp"
+	wifi0="$(temp_by_hwmon_name mt7996_phy0.0)"
+	wifi1="$(temp_by_hwmon_name mt7996_phy0.1)"
+	eth_temp="$(temp_by_hwmon_name 'mdio_bus:07')"
+	rpm="$(read_file "$rp")"
+	rpm_max="$(rpm_display_max "$rpm")"
+	rpm_percent="$(rpm_percent_of_max "$rpm" "$rpm_max")"
+	rpm_source="$(rpm_max_source "$rpm_max")"
+	pwm="$(read_file "$pp")"
+	percent="$(pwm_to_percent "$pwm")"
+	policy="$(read_file "$policy_path")"
+	cooling="$(read_file "$cooling_path")"
+	running=0
+	hardware_ready=0
+	state_label="$(label_for_level "$level")"
+	service_running && running=1
+	[ -n "$temp_path" ] && [ -n "$fan_dir" ] && [ -n "$pp" ] && hardware_ready=1
+
+	ts="$(now)"
+	hb="$(read_file "$HEARTBEAT")"
+	hb_age=""
+	is_uint "$hb" && hb_age=$((ts - hb))
+
+	dt_low="$(read_trip_temp 5)"
+	dt_med="$(read_trip_temp 4)"
+	dt_high="$(read_trip_temp 3)"
+	dt_full="$(read_trip_temp 2)"
+
+	_json_first=1
+	printf '{'
+	json_field mode "$(json_string "$mode")"
+	json_field interval "$(json_num "$interval")"
+	json_field fixed_percent "$(json_num "$fixed_percent")"
+	json_field temp_mC "$(json_num "$display_temp")"
+	json_field raw_temp_mC "$(json_num "$raw_temp")"
+	json_field smooth_temp_mC "$(json_num "$smoothed_temp")"
+	json_field wifi0_temp_mC "$(json_num "$wifi0")"
+	json_field wifi1_temp_mC "$(json_num "$wifi1")"
+	json_field eth_temp_mC "$(json_num "$eth_temp")"
+	json_field rpm "$(json_num "$rpm")"
+	json_field rpm_min "$(json_num 0)"
+	json_field rpm_max "$(json_num "$rpm_max")"
+	json_field rpm_percent "$rpm_percent"
+	json_field rpm_max_source "$(json_string "$rpm_source")"
+	json_field pwm "$(json_num "$pwm")"
+	json_field pwm_percent "$percent"
+	json_field target_percent "$(json_num "$target_percent")"
+	json_field level "$(json_string "$level")"
+	json_field level_label "$(json_string "$state_label")"
+	json_field reason "$(json_string "$reason")"
+	json_field fault "$(json_num "$fault")"
+	json_field spinup_until "$(json_num "$spinup_until")"
+	json_field bad_rpm_count "$(json_num "$bad_rpm_count")"
+	json_field rpm_floor "$(json_num "$(rpm_floor_for_level "$level" "$target_percent")")"
+	json_field service_running "$(json_num "$running")"
+	json_field hardware_ready "$(json_num "$hardware_ready")"
+	json_field heartbeat_age "$(json_num "$hb_age")"
+	json_field thermal_policy "$(json_string "$policy")"
+	json_field cooling_state "$(json_num "$cooling")"
+	json_field default_policy "$(json_string "step_wise")"
+	json_field default_levels "$(json_string "0% / 50% / 75% / 100%")"
+	json_field default_trip_low_mC "$(json_num "$dt_low")"
+	json_field default_trip_med_mC "$(json_num "$dt_med")"
+	json_field default_trip_high_mC "$(json_num "$dt_high")"
+	json_field default_trip_full_mC "$(json_num "$dt_full")"
+	json_field auto_start_low_mC "$(json_num "$AUTO_START_LOW")"
+	json_field auto_start_med_mC "$(json_num "$AUTO_START_MED")"
+	json_field auto_start_high_mC "$(json_num "$AUTO_START_HIGH")"
+	json_field auto_start_full_mC "$(json_num "$AUTO_START_FULL")"
+	json_field auto_drop_off_mC "$(json_num "$AUTO_DROP_OFF")"
+	json_field auto_drop_low_mC "$(json_num "$AUTO_DROP_LOW")"
+	json_field auto_drop_med_mC "$(json_num "$AUTO_DROP_MED")"
+	json_field auto_drop_high_mC "$(json_num "$AUTO_DROP_HIGH")"
+	json_field auto_hold_off "$(json_num "$AUTO_HOLD_OFF")"
+	json_field auto_hold_low "$(json_num "$AUTO_HOLD_LOW")"
+	json_field auto_hold_med "$(json_num "$AUTO_HOLD_MED")"
+	json_field auto_hold_high "$(json_num "$AUTO_HOLD_HIGH")"
+	json_field auto_min_run "$(json_num "$AUTO_MIN_RUN")"
+	json_field kick_seconds "$(json_num "$KICK_SECONDS")"
+	json_field startup_grace "$(json_num "$STARTUP_GRACE")"
+	printf '}\n'
+}
+
+desired_up_level() {
+	local temp="$1"
+
+	if [ "$temp" -ge "$AUTO_START_FULL" ]; then
+		printf 'full'
+	elif [ "$temp" -ge "$AUTO_START_HIGH" ]; then
+		printf 'high'
+	elif [ "$temp" -ge "$AUTO_START_MED" ]; then
+		printf 'medium'
+	elif [ "$temp" -ge "$AUTO_START_LOW" ]; then
+		printf 'low'
+	else
+		printf 'off'
+	fi
+}
+
+level_rank() {
+	case "$1" in
+		low) printf '1' ;;
+		medium) printf '2' ;;
+		high) printf '3' ;;
+		full|fault) printf '4' ;;
+		*) printf '0' ;;
+	esac
+}
+
+down_candidate() {
+	local temp="$1"
+
+	case "$level" in
+		full)
+			[ "$temp" -le "$AUTO_DROP_HIGH" ] && printf 'high' || printf 'full'
+			;;
+		high)
+			[ "$temp" -le "$AUTO_DROP_MED" ] && printf 'medium' || printf 'high'
+			;;
+		medium)
+			[ "$temp" -le "$AUTO_DROP_LOW" ] && printf 'low' || printf 'medium'
+			;;
+		low)
+			[ "$temp" -le "$AUTO_DROP_OFF" ] && printf 'off' || printf 'low'
+			;;
+		*)
+			printf 'off'
+			;;
+	esac
+}
+
+hold_seconds_for_target() {
+	case "$1" in
+		off) printf '%s' "$AUTO_HOLD_OFF" ;;
+		low) printf '%s' "$AUTO_HOLD_LOW" ;;
+		medium) printf '%s' "$AUTO_HOLD_MED" ;;
+		high) printf '%s' "$AUTO_HOLD_HIGH" ;;
+		*) printf '0' ;;
+	esac
+}
+
+apply_fault() {
+	local ts="$1"
+	local msg="$2"
+
+	level="fault"
+	target_percent=100
+	last_change="$ts"
+	pending_level=""
+	pending_since=0
+	spinup_until=0
+	bad_rpm_count="$BAD_RPM_LIMIT"
+	reason="$msg"
+	fault=1
+	set_fan_percent_raw 100
+	save_state
+	log_msg "$msg"
+}
+
+apply_level() {
+	local new_level="$1"
+	local ts="$2"
+	local percent
+
+	percent="$(percent_for_level "$new_level")"
+
+	if [ "$level" = "off" ] && [ "$new_level" != "off" ]; then
+		set_fan_percent_raw 100
+		sleep "$KICK_SECONDS"
+		last_start="$ts"
+		spinup_until=$((ts + STARTUP_GRACE))
+		bad_rpm_count=0
+	fi
+
+	set_fan_percent_raw "$percent"
+	level="$new_level"
+	target_percent="$percent"
+	last_change="$ts"
+	pending_level=""
+	pending_since=0
+	fault=0
+	[ "$new_level" = "off" ] && spinup_until=0
+}
+
+check_fault_recovery() {
+	local ts="$1"
+	local rpm floor
+
+	[ "$level" = "fault" ] || return 1
+
+	rpm="$(read_file "$(rpm_path)")"
+	update_rpm_observed "$rpm" || true
+	floor="$(rpm_floor_for_level fault 100)"
+	if is_uint "$rpm" && [ "$rpm" -ge "$floor" ]; then
+		level="full"
+		target_percent=100
+		last_change="$ts"
+		pending_level=""
+		pending_since=0
+		spinup_until=0
+		bad_rpm_count=0
+		fault=0
+		reason="转速恢复正常，退出异常保护，先保持满速保护"
+		set_fan_percent_raw 100
+		save_state
+		return 1
+	fi
+
+	set_fan_percent_raw 100
+	reason="转速仍异常，保持满速保护"
+	save_state
+	return 0
+}
+
+check_rpm_health() {
+	local ts="$1"
+	local rpm floor
+
+	case "$level" in
+		low|medium|high|full|fixed) ;;
+		*) return 1 ;;
+	esac
+
+	[ "$target_percent" -gt 0 ] || return 1
+
+	if [ "$spinup_until" -gt "$ts" ]; then
+		bad_rpm_count=0
+		reason="启动确认中，等待转速传感器刷新"
+		save_state
+		return 0
+	fi
+
+	rpm="$(read_file "$(rpm_path)")"
+	update_rpm_observed "$rpm" || true
+	floor="$(rpm_floor_for_level "$level" "$target_percent")"
+	if is_uint "$rpm" && [ "$rpm" -lt "$floor" ]; then
+		bad_rpm_count=$((bad_rpm_count + 1))
+		if [ "$bad_rpm_count" -ge "$BAD_RPM_LIMIT" ]; then
+			apply_fault "$ts" "连续检测不到有效转速，已满速保护"
+			return 0
+		fi
+
+		reason="转速低于安全阈值 ${floor} RPM，正在第 ${bad_rpm_count}/${BAD_RPM_LIMIT} 次确认"
+		save_state
+		return 0
+	fi
+
+	bad_rpm_count=0
+	return 1
+}
+
+auto_once() {
+	local raw temp ts up up_rank cur_rank down target hold elapsed run_elapsed
+
+	load_state
+	raw="$(read_file "$(cpu_temp_path)")"
+	ts="$(now)"
+	heartbeat
+
+	if ! is_uint "$raw"; then
+		apply_fault "$ts" "温度读取失败，已满速保护"
+		return
+	fi
+
+	smooth_temp "$raw" >/dev/null || {
+		apply_fault "$ts" "温度平滑计算失败，已满速保护"
+		return
+	}
+	temp="$smoothed_temp"
+
+	if [ "$raw" -ge "$AUTO_START_FULL" ]; then
+		up="full"
+	else
+		up="$(desired_up_level "$temp")"
+	fi
+
+	if [ "$level" = "fault" ]; then
+		check_fault_recovery "$ts" && return
+	fi
+
+	up_rank="$(level_rank "$up")"
+	cur_rank="$(level_rank "$level")"
+
+	if [ "$up_rank" -gt "$cur_rank" ]; then
+		apply_level "$up" "$ts"
+		reason="判断温度 $((temp / 1000))°C，升档到 $(label_for_level "$up")"
+		save_state
+		return
+	fi
+
+	check_rpm_health "$ts" && return
+
+	down="$(down_candidate "$temp")"
+	target="$level"
+	cur_rank="$(level_rank "$level")"
+
+	if [ "$(level_rank "$down")" -lt "$cur_rank" ]; then
+		hold="$(hold_seconds_for_target "$down")"
+		if [ "$pending_level" != "$down" ]; then
+			pending_level="$down"
+			pending_since="$ts"
+		fi
+
+		elapsed=$((ts - pending_since))
+		run_elapsed=$((ts - last_start))
+		if [ "$down" = "off" ] && [ "$run_elapsed" -lt "$AUTO_MIN_RUN" ]; then
+			reason="温度已低，但风扇至少运行 ${AUTO_MIN_RUN} 秒后才允许停止"
+		elif [ "$elapsed" -ge "$hold" ]; then
+			target="$down"
+			apply_level "$target" "$ts"
+			reason="判断温度 $((temp / 1000))°C，稳定回落后降档到 $(label_for_level "$target")"
+			save_state
+			return
+		else
+			reason="低于回落阈值，稳定 ${hold} 秒后再降档或停转"
+		fi
+	else
+		pending_level=""
+		pending_since=0
+		if [ "$level" = "off" ]; then
+			reason="判断温度 $((temp / 1000))°C，未达到 65°C 启动阈值，保持停止"
+		else
+			reason="判断温度 $((temp / 1000))°C，在缓冲区内保持 $(label_for_level "$level")"
+		fi
+	fi
+
+	set_fan_percent_raw "$(percent_for_level "$level")"
+	target_percent="$(percent_for_level "$level")"
+	save_state
+}
+
+fixed_once() {
+	local fixed_percent ts rpm
+
+	load_state
+	ts="$(now)"
+	heartbeat
+	fixed_percent="$(clamp "$(uci_get fixed_percent "$(uci_get fan_percent 70)")" 50 100)"
+
+	set_fan_percent_raw "$fixed_percent"
+	rpm="$(read_file "$(rpm_path)")"
+	update_rpm_observed "$rpm" || true
+	target_percent="$fixed_percent"
+	[ "$fixed_percent" -gt 0 ] && level="fixed" || level="off"
+	last_change="$ts"
+	last_start="$ts"
+	spinup_until=0
+	bad_rpm_count=0
+	reason="固定风力调试模式"
+	fault=0
+	save_state
+}
+
+run_daemon() {
+	local mode interval
+
+	set_oom_score -500
+	echo "$$" > "$PIDFILE"
+	heartbeat
+	trap 'restore_system; exit 0' INT TERM EXIT
+	log_msg "started"
+
+	while :; do
+		mode="$(uci_get mode system)"
+		interval="$(clamp "$(uci_get interval "$DEFAULT_INTERVAL")" 1 60)"
+
+		case "$mode" in
+			auto)
+				auto_once
+				;;
+			fixed)
+				fixed_once
+				;;
+			*)
+				restore_system
+				log_msg "system mode, stopped"
+				exit 0
+				;;
+		esac
+
+		sleep "$interval"
+	done
+}
+
+watchdog_once() {
+	local mode ts hb age raw pid
+
+	mode="$(uci_get mode system)"
+	case "$mode" in
+		auto|fixed) ;;
+		*) exit 0 ;;
+	esac
+
+	ts="$(now)"
+	hb="$(read_file "$HEARTBEAT")"
+	if is_uint "$hb"; then
+		age=$((ts - hb))
+	elif service_running; then
+		return 0
+	else
+		age=$((WATCHDOG_STALE + 1))
+	fi
+
+	service_running && [ "$age" -le "$WATCHDOG_STALE" ] && return 0
+
+	pid="$(read_file "$PIDFILE")"
+	raw="$(read_file "$(cpu_temp_path)")"
+	if is_uint "$raw" && [ "$raw" -ge "$AUTO_START_LOW" ]; then
+		set_fan_percent_raw 100
+		log_msg "watchdog: service stale, temperature high, forced 100% fan"
+	else
+		restore_system
+		log_msg "watchdog: service stale, restored system fan control"
+	fi
+
+	[ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+	/etc/init.d/fancontrol restart >/dev/null 2>&1 &
+	exit 0
+}
+
+run_watchdog() {
+	set_oom_score -400
+	log_msg "watchdog started"
+
+	while :; do
+		watchdog_once
+		sleep "$WATCHDOG_INTERVAL"
+	done
+}
+
+wait_service_state() {
+	local want="$1"
+	local i=0
+
+	while [ "$i" -lt 5 ]; do
+		if [ "$want" = "running" ]; then
+			service_running && return 0
+		else
+			service_running || return 0
+		fi
+		sleep 1
+		i=$((i + 1))
+	done
+
+	return 1
+}
+
+apply_config() {
+	local mode
+
+	mode="$(uci_get mode system)"
+	case "$mode" in
+		auto|fixed)
+			/etc/init.d/fancontrol restart >/dev/null 2>&1 || true
+			wait_service_state running || true
+			;;
+		*)
+			/etc/init.d/fancontrol stop >/dev/null 2>&1 || true
+			restore_system
+			wait_service_state stopped || true
+			;;
+	esac
+
+	print_status
+}
+
+system_mode() {
+	uci -q set "$CONFIG.$SECTION.mode=system"
+	uci -q commit "$CONFIG"
+	/etc/init.d/fancontrol stop >/dev/null 2>&1 || true
+	restore_system
+	print_status
+}
+
+case "$1" in
+	status|'')
+		print_status
+		;;
+	run)
+		run_daemon
+		;;
+	watchdog)
+		run_watchdog
+		;;
+	apply)
+		apply_config
+		;;
+	system)
+		system_mode
+		;;
+	restore-system)
+		restore_system
+		;;
+	set-percent)
+		set_fan_percent_raw "$2"
+		print_status
+		;;
+	*)
+		echo "Usage: $0 {status|run|watchdog|apply|system|restore-system|set-percent VALUE}" >&2
+		exit 1
+		;;
+esac

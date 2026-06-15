@@ -1,0 +1,4 @@
+config settings 'settings'
+	option mode 'system'
+	option fixed_percent '70'
+	option interval '3'

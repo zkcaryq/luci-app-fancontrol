@@ -1,0 +1,25 @@
+# OpenWrt build outputs
+/bin/
+/build_dir/
+/dl/
+/feeds/
+/logs/
+/staging_dir/
+/tmp/
+
+# Package artifacts
+*.ipk
+*.apk
+*.run
+*.tar
+*.tar.gz
+*.zip
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

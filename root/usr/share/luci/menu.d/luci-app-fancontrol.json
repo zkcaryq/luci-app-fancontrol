@@ -1,0 +1,16 @@
+{
+	"admin/system/fancontrol": {
+		"title": "风扇控制",
+		"order": 62,
+		"action": {
+			"type": "view",
+			"path": "system/fancontrol"
+		},
+		"depends": {
+			"acl": [ "luci-app-fancontrol" ],
+			"fs": {
+				"/usr/bin/fancontrol": "executable"
+			}
+		}
+	}
+}

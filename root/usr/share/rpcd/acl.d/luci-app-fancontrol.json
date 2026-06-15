@@ -1,0 +1,20 @@
+{
+	"luci-app-fancontrol": {
+		"description": "Grant access to fan control",
+		"read": {
+			"file": {
+				"/usr/bin/fancontrol status": [ "exec" ]
+			},
+			"uci": [ "fancontrol" ]
+		},
+		"write": {
+			"file": {
+				"/usr/bin/fancontrol apply": [ "exec" ],
+				"/usr/bin/fancontrol system": [ "exec" ],
+				"/etc/init.d/fancontrol reload": [ "exec" ],
+				"/etc/init.d/fancontrol restart": [ "exec" ]
+			},
+			"uci": [ "fancontrol" ]
+		}
+	}
+}
