@@ -5,10 +5,8 @@
 适用于 GL.iNet GL-MT3600BE / Beryl 7 的 LuCI 风扇控制插件，面向
 ImmortalWrt / OpenWrt 风格固件，已适配 `apk` 包管理环境。
 
-安装后会在 LuCI 的 **系统 > 风扇控制** 下新增页面。页面会显示 CPU
-温度、无线芯片温度、网口温度、风扇转速、估算转速百分比和当前控制模式。
-默认安装后为 `system` 模式，不会立即接管风扇；只有用户选择自动温控或固定
-风力后才会接管控制。
+安装后会在 LuCI 的 **系统 > 风扇控制** 下新增页面。默认安装后为
+`system` 模式，不会立即接管风扇；只有用户选择自动温控或固定风力后才会接管。
 
 ## 截图
 
@@ -22,27 +20,13 @@ LuCI 主题为 Argon。
 ## 功能
 
 - 在 LuCI **系统 > 风扇控制** 下提供图形页面。
-- 自动识别 `cpu_thermal`、`pwmfan`、`fan1_input`、`pwm1` 和 thermal
-  cooling device，不固定写死 `hwmon` 编号。
-- 支持三种控制模式：
-  - `system`：交给内核 / 固件默认策略控制。
-  - `auto`：使用内置静音温控曲线。
-  - `fixed`：固定风力，主要用于短时间调试。
-- 实时状态显示：
-  - CPU 温度
-  - 无线芯片温度
-  - 网口温度
-  - 风力百分比
-  - 风扇实时转速
-  - 估算转速百分比
-  - 当前原因 / 当前状态
+- 显示 CPU、Wi-Fi、网口温度、风扇实时转速、风力百分比和转速百分比。
+- 自动温控使用关键探头最高温度作为控制温度，避免 Wi-Fi 高温被 CPU 低温掩盖。
+- 支持推荐曲线和自定义温度曲线。
+- 自定义只开放温度点，不开放 PWM/sysfs/风力档位等高级参数。
+- 固定风力模式保留为临时调试用途。
 - 使用 procd 管理主进程，并带轻量看门狗。
-- 风扇从停止进入转动档位时，会先满速踢转 1 秒，降低小风扇低 PWM
-  启动失败的概率。
-- 分档 RPM 异常检测，连续异常才进入保护。
 - 默认静默运行，正常轮询和正常切档不写 fancontrol 系统日志。
-- 包含 LuCI ACL 和 ucitrack 元数据，适配较新的 OpenWrt / ImmortalWrt
-  LuCI 保存应用流程。
 
 ## 兼容性
 
@@ -64,29 +48,8 @@ LuCI 主题为 Argon。
 - 风扇转速：`fan1_input`
 - PWM 控制：`pwm1`
 
-### 可能适配的设备
-
-如果其他路由器同时满足以下条件，理论上也可能工作：
-
-- 设备运行 OpenWrt / ImmortalWrt 或接近 LuCI 的固件。
-- 风扇通过 Linux `pwm-fan` 驱动暴露。
-- 系统存在可读的 RPM 节点，例如 `fan1_input`。
-- 系统存在可写的 PWM 节点，例如 `pwm1`。
-- CPU 温度可从 `cpu_thermal` 或 thermal zone 读取。
-
-通常这类设备是带风扇、并采用标准 `pwm-fan` sysfs 布局的 OpenWrt 路由器。
-MediaTek Filogic 设备更可能匹配，但本插件并不强制限制在 Filogic 平台；
-关键取决于 sysfs 节点是否一致。
-
-### 不适合直接使用的设备
-
-以下设备不建议直接使用，需要移植和测试：
-
-- 无风扇路由器。
-- 没有 RPM 转速反馈的设备。
-- 只有 GPIO 开关控制的风扇。
-- 依赖厂商私有风扇守护进程且没有 `pwm1` 的设备。
-- 需要特殊 sysfs 写法的设备。
+其他带风扇的 OpenWrt / ImmortalWrt 设备如果同样使用标准 `pwm-fan` sysfs
+布局，也可能适配；未实机测试前请谨慎使用。
 
 ### 快速兼容性检查
 
@@ -103,79 +66,37 @@ for z in /sys/class/thermal/thermal_zone*; do
 done
 ```
 
-如果找不到 `pwmfan`、`fan1_input` 和 `pwm1`，请先视为不支持，直到完成移植
-和实机测试。
+如果找不到 `pwmfan`、`fan1_input` 和 `pwm1`，请先视为不支持。
 
-## 默认温控策略
+## 安装
 
-自动模式使用偏静音的夏季曲线：
+### 一键安装
 
-| 温度 | 风扇状态 |
-| --- | --- |
-| `< 60°C` | 停止 |
-| `>= 65°C` | 低速 50% |
-| `>= 72°C` | 中速 70% |
-| `>= 79°C` | 高速 85% |
-| `>= 86°C` | 满速保护 100% |
-
-降档和停转带回差与稳定等待：
-
-| 变化 | 条件 |
-| --- | --- |
-| 低速 -> 停止 | `<= 60°C` 稳定 60 秒 |
-| 中速 -> 低速 | `<= 68°C` 稳定 45 秒 |
-| 高速 -> 中速 | `<= 75°C` 稳定 45 秒 |
-| 满速 -> 高速 | `<= 82°C` 稳定 30 秒 |
-
-额外保护：
-
-- 风扇启动时先 100% 满速踢转 1 秒，再降到目标档位。
-- 启动后有 9 秒观察期，避免转速传感器尚未刷新时误报异常。
-- 温度使用最近 3 次读数平滑。
-- 默认轮询周期为 3 秒。
-- 风扇一旦启动，至少运行 60 秒才允许停转。
-
-RPM 异常阈值：
-
-| 档位 | 连续确认前的最低转速 |
-| --- | --- |
-| 低速 | 500 RPM |
-| 中速 | 700 RPM |
-| 高速 | 900 RPM |
-| 满速 | 1000 RPM |
-
-RPM 异常需要连续出现 3 次，才会进入满速保护。
-
-## 风速百分比
-
-页面会同时显示“风力”和“转速”：
-
-- `风力`：写入风扇驱动的 PWM 百分比。
-- `转速`：当前 RPM 除以估算最高 RPM 得出的百分比。
-
-默认最高转速估算值为 `6500 RPM`。这不是官方硬件标称值。如果运行期间观测到
-更高 RPM，服务会使用本次运行中观测到的最高值来显示，直到服务重启。
-
-## 日志
-
-fancontrol 默认静默运行。正常轮询、正常看门狗检查、正常切档都不会写入
-syslog，避免长期运行时产生无意义日志。
-
-如需临时排错，可以创建以下文件开启调试日志：
+在路由器 SSH 里执行其一：
 
 ```sh
-touch /tmp/fancontrol.debug
+wget -O- https://raw.githubusercontent.com/zkcaryq/luci-app-fancontrol/main/install.sh | sh
 ```
-
-关闭调试日志：
 
 ```sh
-rm -f /tmp/fancontrol.debug
+curl -fsSL https://raw.githubusercontent.com/zkcaryq/luci-app-fancontrol/main/install.sh | sh
 ```
 
-运行状态保存在 `/var/run`，在 OpenWrt 类系统中通常是内存路径。
+更安全的方式是先下载、查看，再执行：
 
-## 构建
+```sh
+wget -O /tmp/install-fancontrol.sh https://raw.githubusercontent.com/zkcaryq/luci-app-fancontrol/main/install.sh
+sh /tmp/install-fancontrol.sh
+```
+
+`install.sh` 是便捷源码直装方式，不受 `apk` 数据库管理，系统升级或恢复配置时
+可能需要重新安装。对于长期正式使用，如果 Releases 提供 `.apk` 包，更推荐下载
+`.apk` 后用 `apk add ./包名.apk` 本地安装。
+
+安装脚本不会改软件源、不会执行 `apk upgrade`、不会重启整机、不会覆盖已有
+`/etc/config/fancontrol`。脚本会把被替换的同名文件备份到 `/tmp`。
+
+### SDK 构建
 
 把本包放入 OpenWrt / ImmortalWrt package feed 或 package tree 后，使用常规
 SDK 流程构建。
@@ -186,22 +107,61 @@ make package/luci-app-fancontrol/compile V=s
 
 本包标记为 `PKGARCH:=all`。
 
-## 手动部署测试
+## 如何使用
 
-快速测试时，可以把 `root/` 目录内容复制到目标路由器：
+1. 安装后打开 LuCI，进入 **系统 > 风扇控制**。
+2. 默认是 **系统默认**，插件不接管风扇。
+3. 选择 **自动温控**，再选择：
+   - **推荐曲线**：适合大多数 GL-MT3600BE。
+   - **自定义温度**：只调整温度点，风力档位仍由插件固定保护。
+4. 点击 **保存并应用**。
+5. 页面会显示控制温度、最高温度来源、风扇状态、实时转速和当前原因。
 
-```sh
-scp -r root/* root@<router-ip>:/
-ssh root@<router-ip>
-chmod +x /usr/bin/fancontrol /etc/init.d/fancontrol
-/etc/init.d/rpcd reload
-/etc/init.d/ucitrack restart
-/etc/init.d/fancontrol enable
-/etc/init.d/fancontrol restart
-rm -rf /tmp/luci-*
-```
+固定风力模式仅建议短时间调试，例如确认风扇是否能转、不同风力声音如何。长期
+运行建议使用自动温控。
 
-然后打开 LuCI，进入 **系统 > 风扇控制**。
+## 默认温控策略
+
+自动模式推荐曲线：
+
+| 温度 | 风扇状态 |
+| --- | --- |
+| `< 60°C` | 停止 |
+| `>= 65°C` | 低速 50% |
+| `>= 72°C` | 中速 70% |
+| `>= 79°C` | 高速 85% |
+| `>= 86°C` | 满速保护 100% |
+
+自定义温度只允许修改这 5 个温度点：
+
+- 停止温度：`45-70°C`
+- 低速启动：`55-78°C`
+- 中速启动：`60-84°C`
+- 高速启动：`68-88°C`
+- 满速保护：`80-90°C`
+
+要求：`停止 < 低速 < 中速 < 高速 < 满速保护`，相邻至少间隔 `3°C`。
+
+## 温度建议
+
+| 偏好 | 停止 | 低速 | 中速 | 高速 | 满速保护 |
+| --- | --- | --- | --- | --- | --- |
+| 静音优先 | 62°C | 68°C | 75°C | 82°C | 88°C |
+| 均衡推荐 | 60°C | 65°C | 72°C | 79°C | 86°C |
+| 散热优先 | 58°C | 63°C | 70°C | 77°C | 84°C |
+
+温控内部会自动计算回落阈值，不需要手动设置回差。例如低速和中速之间的回落阈值
+会按整数向下取中间值，避免出现 74.5°C 这类小数判断。
+
+## 保护策略
+
+- 控制温度取 CPU、Wi-Fi 0、Wi-Fi 1、网口等有效温度中的最高值。
+- 温度读数必须是 `0-150°C` 的有效数字，否则进入满速保护。
+- 温度使用最近 3 次读数平滑。
+- 风扇从停止启动时先 100% 踢转 1 秒，再降到目标档位。
+- 启动后 9 秒内不判定转速异常，避免传感器刷新慢导致误报。
+- 低速启动需要短暂确认，停转和降档需要等待温度稳定。
+- 风扇启动后至少运行 90 秒才允许停转。
 
 ## 常用命令
 
@@ -211,6 +171,19 @@ rm -rf /tmp/luci-*
 /usr/bin/fancontrol system
 /etc/init.d/fancontrol restart
 logread -e fancontrol
+```
+
+恢复系统默认控制：
+
+```sh
+/usr/bin/fancontrol system
+```
+
+临时开启调试日志：
+
+```sh
+touch /tmp/fancontrol.debug
+rm -f /tmp/fancontrol.debug
 ```
 
 ## 安全说明

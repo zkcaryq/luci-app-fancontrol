@@ -20,6 +20,27 @@ function fmtTemp(value) {
 	return value != null ? '%.1f °C'.format(value / 1000) : '-';
 }
 
+function fmtTempInt(value) {
+	value = n(value);
+	return value != null ? '%d°C'.format(Math.floor(value / 1000)) : '-';
+}
+
+function fmtSource(source) {
+	if (source == 'CPU')
+		return 'CPU';
+	if (source == 'Wi-Fi 0')
+		return 'Wi-Fi 0';
+	if (source == 'Wi-Fi 1')
+		return 'Wi-Fi 1';
+	if (source == 'Ethernet')
+		return '网口';
+	return source ? source : '-';
+}
+
+function fmtReason(reason) {
+	return (reason || '-').replace(/Ethernet/g, '网口');
+}
+
 function fmtFan(status) {
 	var rpm = n(status.rpm);
 	var pct = n(status.target_percent);
@@ -67,8 +88,16 @@ function modeText(mode) {
 	return '系统默认';
 }
 
+function profileText(status) {
+	if (status.auto_profile == 'custom' && Number(status.curve_valid) == 1)
+		return '自定义温度';
+	if (status.auto_profile == 'custom' && Number(status.curve_valid) != 1)
+		return '自定义温度无效，已使用推荐曲线';
+	return '推荐曲线';
+}
+
 function badgeClass(status) {
-	if (!status || Number(status.hardware_ready) != 1 || Number(status.fault) == 1)
+	if (!status || Number(status.hardware_ready) != 1 || Number(status.fault) == 1 || Number(status.temp_fault) == 1)
 		return 'fan-badge fan-badge-red';
 	if (status.mode == 'system')
 		return 'fan-badge fan-badge-blue';
@@ -90,6 +119,8 @@ function badgeClass(status) {
 function badgeText(status) {
 	if (!status || Number(status.hardware_ready) != 1)
 		return '未检测到风扇硬件';
+	if (Number(status.temp_fault) == 1)
+		return '温度传感器异常';
 	if (Number(status.fault) == 1)
 		return '风扇异常保护';
 	if (status.mode == 'system')
@@ -111,6 +142,43 @@ function setText(id, value) {
 		node.textContent = value;
 }
 
+function setCurveStep(id, title, body) {
+	var titleNode = document.getElementById(id + '-title');
+	var bodyNode = document.getElementById(id + '-body');
+	if (titleNode)
+		titleNode.textContent = title;
+	if (bodyNode)
+		bodyNode.textContent = body;
+}
+
+function updateCurve(status) {
+	status = status || {};
+
+	setText('fancontrol-curve-profile', profileText(status));
+	setText('fancontrol-hero-main', '%s：%s 才启动，%s 以下稳定 %d 秒才停止。'.format(
+		profileText(status),
+		fmtTempInt(status.auto_start_low_mC),
+		fmtTempInt(status.auto_drop_off_mC),
+		n(status.auto_hold_off) || 90
+	));
+
+	setCurveStep('curve-off',
+		'< ' + fmtTempInt(status.auto_start_low_mC),
+		'停止；低速回落到 ' + fmtTempInt(status.auto_drop_off_mC) + ' 后稳定 ' + (n(status.auto_hold_off) || 90) + ' 秒才停');
+	setCurveStep('curve-low',
+		'>= ' + fmtTempInt(status.auto_start_low_mC),
+		'低速 50%；中速回落到 ' + fmtTempInt(status.auto_drop_low_mC) + ' 后稳定 ' + (n(status.auto_hold_low) || 60) + ' 秒降回');
+	setCurveStep('curve-med',
+		'>= ' + fmtTempInt(status.auto_start_med_mC),
+		'中速 70%；高速回落到 ' + fmtTempInt(status.auto_drop_med_mC) + ' 后稳定 ' + (n(status.auto_hold_med) || 60) + ' 秒降回');
+	setCurveStep('curve-high',
+		'>= ' + fmtTempInt(status.auto_start_high_mC),
+		'高速 85%；满速回落到 ' + fmtTempInt(status.auto_drop_high_mC) + ' 后稳定 ' + (n(status.auto_hold_high) || 45) + ' 秒降回');
+	setCurveStep('curve-full',
+		'>= ' + fmtTempInt(status.auto_start_full_mC),
+		'满速保护 100%，立即响应');
+}
+
 function updateStatus(status) {
 	status = status || {};
 
@@ -120,13 +188,17 @@ function updateStatus(status) {
 		badge.textContent = badgeText(status);
 	}
 
-	setText('fancontrol-temp', fmtTemp(status.raw_temp_mC || status.temp_mC));
+	setText('fancontrol-control-temp', '%s（最高：%s）'.format(fmtTemp(status.control_temp_mC || status.temp_mC), fmtSource(status.control_temp_source)));
+	setText('fancontrol-temp', fmtTemp(status.cpu_temp_mC || status.raw_temp_mC));
 	setText('fancontrol-wifi', [ fmtTemp(status.wifi0_temp_mC), fmtTemp(status.wifi1_temp_mC) ].join(' / '));
 	setText('fancontrol-eth', fmtTemp(status.eth_temp_mC));
 	setText('fancontrol-fan', fmtFan(status));
 	setText('fancontrol-mode', modeText(status.mode));
-	setText('fancontrol-reason', status.reason || '-');
+	setText('fancontrol-profile', profileText(status));
+	setText('fancontrol-reason', fmtReason(status.reason));
 	setText('fancontrol-default', '内核策略 %s，设备树档位 %s'.format(status.thermal_policy || 'step_wise', status.default_levels || '0% / 50% / 75% / 100%'));
+
+	updateCurve(status);
 }
 
 function statusRow(label, id) {
@@ -143,6 +215,53 @@ function refreshStatus() {
 	});
 }
 
+function fieldValue(name) {
+	var node = document.querySelector('[name="cbid.fancontrol.settings.' + name + '"]');
+	return node ? node.value : null;
+}
+
+function validateCurveUi() {
+	var mode = fieldValue('mode');
+	var profile = fieldValue('auto_profile');
+	var values, names, ranges, i, v;
+
+	if (mode != 'auto' || profile != 'custom')
+		return true;
+
+	names = [ '停止温度', '低速启动温度', '中速启动温度', '高速启动温度', '满速保护温度' ];
+	values = [
+		Number(fieldValue('auto_stop_temp')),
+		Number(fieldValue('auto_low_temp')),
+		Number(fieldValue('auto_med_temp')),
+		Number(fieldValue('auto_high_temp')),
+		Number(fieldValue('auto_full_temp'))
+	];
+	ranges = [
+		[ 45, 70 ],
+		[ 55, 78 ],
+		[ 60, 84 ],
+		[ 68, 88 ],
+		[ 80, 90 ]
+	];
+
+	for (i = 0; i < values.length; i++) {
+		v = values[i];
+		if (!isFinite(v) || Math.floor(v) != v || v < ranges[i][0] || v > ranges[i][1]) {
+			ui.addNotification(null, E('p', '%s 必须是 %d-%d°C 的整数。'.format(names[i], ranges[i][0], ranges[i][1])), 'danger');
+			return false;
+		}
+	}
+
+	for (i = 1; i < values.length; i++) {
+		if (values[i] - values[i - 1] < 3) {
+			ui.addNotification(null, E('p', '温度必须按 停止 < 低速 < 中速 < 高速 < 满速保护 递增，且相邻至少间隔 3°C。'), 'danger');
+			return false;
+		}
+	}
+
+	return true;
+}
+
 function applyFancontrol() {
 	return fs.exec('/usr/bin/fancontrol', [ 'apply' ])
 		.then(function() {
@@ -154,6 +273,9 @@ function applyFancontrol() {
 }
 
 function saveAndApply(map) {
+	if (!validateCurveUi())
+		return Promise.resolve();
+
 	return map.save(null, true)
 		.then(function() {
 			return L.resolveDefault(ui.changes.apply(false), null);
@@ -171,8 +293,15 @@ function styleBlock() {
 		'.fan-badge-blue{background:#183b66;color:#d8ecff}.fan-badge-green{background:#154d2f;color:#d8ffe8}.fan-badge-cyan{background:#0d4b55;color:#d8fbff}.fan-badge-yellow{background:#5a4a12;color:#fff2b8}.fan-badge-orange{background:#633715;color:#ffe2c7}.fan-badge-red{background:#661f24;color:#ffe0e0}',
 		'.fan-note{line-height:1.7;color:#ddd}.fan-note strong{color:#fff}.fan-muted{color:#aaa;font-size:12px}',
 		'.fan-status-table .td{vertical-align:middle}.fan-status-table .td:first-child{width:190px;text-align:left}.fan-status-table .td:nth-child(2){text-align:left!important}',
-		'.fan-curve{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:10px;margin-top:10px}.fan-step{min-height:56px;padding:10px 12px;border-radius:8px;background:#1c1c1c;border:1px solid #444}.fan-step b{display:block;margin-bottom:4px;color:#fff}',
-		'@media(max-width:900px){.fan-curve{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}}'
+		'.fan-curve{display:grid;grid-template-columns:repeat(5,minmax(140px,1fr));gap:10px;margin-top:10px}.fan-step{min-height:74px;padding:10px 12px;border-radius:8px;background:#1c1c1c;border:1px solid #444}.fan-step b{display:block;margin-bottom:4px;color:#fff}.fan-step span{color:#bbb;font-size:12px;line-height:1.5}',
+		'@media(max-width:900px){.fan-curve{grid-template-columns:repeat(auto-fit,minmax(160px,1fr))}}'
+	]);
+}
+
+function curveStep(id) {
+	return E('div', { 'class': 'fan-step' }, [
+		E('b', { 'id': id + '-title' }, '-'),
+		E('span', { 'id': id + '-body' }, '-')
 	]);
 }
 
@@ -192,17 +321,19 @@ return view.extend({
 			E('div', { 'class': 'fan-hero' }, [
 				E('div', { 'id': 'fancontrol-badge', 'class': 'fan-badge fan-badge-blue' }, '读取中'),
 				E('div', { 'class': 'fan-note' }, [
-					E('div', {}, [ E('strong', {}, '夏季静音曲线：'), '65°C 才启动，60°C 以下稳定 60 秒才停止。' ]),
-					E('div', { 'class': 'fan-muted' }, '启动时会满速 1 秒，之后观察 9 秒确认转速；中间温度保持当前档位，避免频繁变速。')
+					E('div', {}, [ E('strong', {}, '温控曲线：'), E('span', { 'id': 'fancontrol-hero-main' }, '读取中') ]),
+					E('div', { 'class': 'fan-muted' }, '控制温度取 CPU、Wi-Fi、网口等关键探头的最高值；启动和降档会等待温度稳定，保护风扇寿命。')
 				])
 			]),
 			E('h3', {}, '实时状态'),
 			E('table', { 'class': 'table fan-status-table' }, [
+				statusRow('控制温度', 'fancontrol-control-temp'),
 				statusRow('CPU 温度', 'fancontrol-temp'),
 				statusRow('无线芯片温度', 'fancontrol-wifi'),
 				statusRow('网口温度', 'fancontrol-eth'),
 				statusRow('风扇状态', 'fancontrol-fan'),
 				statusRow('控制模式', 'fancontrol-mode'),
+				statusRow('温控方案', 'fancontrol-profile'),
 				statusRow('当前原因', 'fancontrol-reason'),
 				statusRow('系统默认', 'fancontrol-default')
 			])
@@ -210,18 +341,22 @@ return view.extend({
 
 		var curveBox = E('div', { 'class': 'cbi-section' }, [
 			E('h3', {}, '自动温控曲线'),
-			E('div', { 'class': 'fan-note' }, '自动模式不需要手动设置转速，系统会按温度自动分档。降档和停转会等待温度稳定，服务异常时看门狗会自动恢复。'),
+			E('div', { 'class': 'fan-note' }, [
+				'当前方案：',
+				E('strong', { 'id': 'fancontrol-curve-profile' }, '读取中'),
+				'。自动模式只允许调整温度点，风力档位固定为 50% / 70% / 85% / 100%，避免误设伤风扇。'
+			]),
 			E('div', { 'class': 'fan-curve' }, [
-				E('div', { 'class': 'fan-step' }, [ E('b', {}, '< 60°C'), '停止' ]),
-				E('div', { 'class': 'fan-step' }, [ E('b', {}, '>= 65°C'), '低速 50%' ]),
-				E('div', { 'class': 'fan-step' }, [ E('b', {}, '>= 72°C'), '中速 70%' ]),
-				E('div', { 'class': 'fan-step' }, [ E('b', {}, '>= 79°C'), '高速 85%' ]),
-				E('div', { 'class': 'fan-step' }, [ E('b', {}, '>= 86°C'), '满速保护 100%' ])
+				curveStep('curve-off'),
+				curveStep('curve-low'),
+				curveStep('curve-med'),
+				curveStep('curve-high'),
+				curveStep('curve-full')
 			])
 		]);
 
 		m = new form.Map('fancontrol', '风扇控制');
-		m.description = '默认使用系统控制。自动温控采用 65°C 启动、60°C 稳定停转的夏季静音曲线；固定风力仅建议临时调试。';
+		m.description = '默认使用系统控制。自动温控可使用推荐曲线，也可只自定义温度点；固定风力仅建议临时调试。';
 		m.submit = false;
 		m.reset = false;
 
@@ -234,6 +369,52 @@ return view.extend({
 		o.value('fixed', '固定风力（调试用）');
 		o.default = 'system';
 		o.rmempty = false;
+
+		o = s.option(form.ListValue, 'auto_profile', '温控方案');
+		o.value('preset', '推荐曲线');
+		o.value('custom', '自定义温度');
+		o.default = 'preset';
+		o.rmempty = false;
+		o.depends('mode', 'auto');
+		o.description = '推荐曲线适合大多数 GL-MT3600BE；自定义温度只调整温度点，不允许修改风力档位。';
+
+		o = s.option(form.Value, 'auto_stop_temp', '停止温度');
+		o.datatype = 'range(45,70)';
+		o.default = '60';
+		o.placeholder = '60';
+		o.rmempty = false;
+		o.depends({ mode: 'auto', auto_profile: 'custom' });
+		o.description = '低速回落到此温度后，还需要稳定 90 秒才会停转。';
+
+		o = s.option(form.Value, 'auto_low_temp', '低速启动');
+		o.datatype = 'range(55,78)';
+		o.default = '65';
+		o.placeholder = '65';
+		o.rmempty = false;
+		o.depends({ mode: 'auto', auto_profile: 'custom' });
+		o.description = '达到此温度后，会先确认约 6 秒再启动低速，避免频繁启停。';
+
+		o = s.option(form.Value, 'auto_med_temp', '中速启动');
+		o.datatype = 'range(60,84)';
+		o.default = '72';
+		o.placeholder = '72';
+		o.rmempty = false;
+		o.depends({ mode: 'auto', auto_profile: 'custom' });
+
+		o = s.option(form.Value, 'auto_high_temp', '高速启动');
+		o.datatype = 'range(68,88)';
+		o.default = '79';
+		o.placeholder = '79';
+		o.rmempty = false;
+		o.depends({ mode: 'auto', auto_profile: 'custom' });
+
+		o = s.option(form.Value, 'auto_full_temp', '满速保护');
+		o.datatype = 'range(80,90)';
+		o.default = '86';
+		o.placeholder = '86';
+		o.rmempty = false;
+		o.depends({ mode: 'auto', auto_profile: 'custom' });
+		o.description = '达到满速保护温度会立即 100% 转速，不等待确认。';
 
 		o = s.option(form.Value, 'fixed_percent', '固定风力');
 		o.datatype = 'range(50,100)';

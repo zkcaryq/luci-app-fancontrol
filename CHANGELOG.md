@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.0
+
+- Add recommended/custom automatic temperature profiles.
+- Allow custom automatic temperature points without exposing fan power levels.
+- Use the highest valid CPU / Wi-Fi / Ethernet temperature as the control temperature.
+- Add stricter sensor validation and full-speed protection for invalid readings.
+- Add longer startup, stop, and downshift guards to reduce fan wear.
+- Add `install.sh` for convenient source installation on compatible routers.
+- Expand Chinese and English README usage and installation documentation.
+
 ## 1.0.3
 
 - Add LuCI ACL compatibility for fancontrol service reload / restart.

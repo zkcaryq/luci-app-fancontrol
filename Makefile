@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-fancontrol
-PKG_VERSION:=1.0.3
+PKG_VERSION:=1.1.0
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 
@@ -17,8 +17,8 @@ define Package/luci-app-fancontrol
 endef
 
 define Package/luci-app-fancontrol/description
-  Simple LuCI fan control page with CPU temperature, fan RPM, and basic
-  temperature based start/stop controls.
+  Simple LuCI fan control page with global temperature protection, fan RPM,
+  recommended and custom automatic temperature curves.
 endef
 
 define Build/Compile
