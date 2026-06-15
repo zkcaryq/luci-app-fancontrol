@@ -8,6 +8,15 @@ wireless and Ethernet chip temperatures, fan speed, fan speed percentage, and
 the current control mode. The default installed mode is `system`, so the package
 does not take over the fan until the user selects automatic or fixed control.
 
+## Screenshots
+
+Screenshots from GL.iNet GL-MT3600BE / Beryl 7 running ImmortalWrt 25.12 with
+Argon theme:
+
+![Desktop fan control page](docs/images/fancontrol-desktop.png)
+
+<img src="docs/images/fancontrol-mobile.png" alt="Narrow fan control page" width="360">
+
 ## Features
 
 - LuCI page under `System > Fan Control`.
