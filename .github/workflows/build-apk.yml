@@ -101,10 +101,13 @@ jobs:
         run: |
           set -eux
           mkdir -p release
-          find sdk/bin/packages -type f -name "${PACKAGE_NAME}_*.apk" -print -exec cp -v {} release/ \;
-          apk_count="$(find release -maxdepth 1 -type f -name "${PACKAGE_NAME}_*.apk" | wc -l)"
+          find sdk/bin/packages -type f \( -name "${PACKAGE_NAME}-*.apk" -o -name "${PACKAGE_NAME}_*.apk" \) \
+            ! -name "${PACKAGE_NAME}-src-*.apk" \
+            ! -name "${PACKAGE_NAME}_src_*.apk" \
+            -print -exec cp -v {} release/ \;
+          apk_count="$(find release -maxdepth 1 -type f \( -name "${PACKAGE_NAME}-*.apk" -o -name "${PACKAGE_NAME}_*.apk" \) | wc -l)"
           test "$apk_count" -gt 0
-          first_apk="$(find release -maxdepth 1 -type f -name "${PACKAGE_NAME}_*.apk" | sort | head -n 1)"
+          first_apk="$(find release -maxdepth 1 -type f \( -name "${PACKAGE_NAME}-*.apk" -o -name "${PACKAGE_NAME}_*.apk" \) | sort | head -n 1)"
           cp "$first_apk" "release/${PACKAGE_NAME}_latest_all.apk"
           (
             cd release
