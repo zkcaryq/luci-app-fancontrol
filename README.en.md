@@ -118,6 +118,12 @@ wget -O /tmp/luci-app-fancontrol.apk https://github.com/zkcaryq/luci-app-fancont
 apk add /tmp/luci-app-fancontrol.apk
 ```
 
+The APK no longer hard-depends on the `kmod-hwmon-pwmfan` package. The router
+must already provide the `pwm-fan` driver, either built into the kernel or
+installed separately, and expose the expected `pwmfan`, `fan1_input`, and
+`pwm1` sysfs nodes. If those nodes do not exist, the package may install but it
+will not be able to control the fan.
+
 The rolling build follows the `main` branch and is best for early testing. For
 long-term stable use, prefer a versioned Release when available.
 

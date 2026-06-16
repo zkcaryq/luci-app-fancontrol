@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-fancontrol
 PKG_VERSION:=1.1.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_LICENSE:=MIT
 
 include $(INCLUDE_DIR)/package.mk
@@ -12,7 +12,7 @@ define Package/luci-app-fancontrol
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=Simple fan control for GL-MT3600BE
-  DEPENDS:=+luci-base +rpcd +kmod-hwmon-pwmfan
+  DEPENDS:=+luci-base +rpcd
   PKGARCH:=all
 endef
 

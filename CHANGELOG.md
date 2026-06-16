@@ -2,6 +2,9 @@
 
 ## 1.1.0
 
+- Release `1.1.0-r2`: remove the hard `kmod-hwmon-pwmfan` package dependency.
+- Keep runtime hardware detection and require the router to already expose the
+  expected `pwm-fan` sysfs nodes.
 - Add recommended/custom automatic temperature profiles.
 - Allow custom automatic temperature points without exposing fan power levels.
 - Use the highest valid CPU / Wi-Fi / Ethernet temperature as the control temperature.

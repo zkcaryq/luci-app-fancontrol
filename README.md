@@ -110,6 +110,10 @@ wget -O /tmp/luci-app-fancontrol.apk https://github.com/zkcaryq/luci-app-fancont
 apk add /tmp/luci-app-fancontrol.apk
 ```
 
+当前 APK 不再强制依赖 `kmod-hwmon-pwmfan` 软件包。只要你的固件内核已经内建
+或已安装 `pwm-fan` 驱动，并且系统里实际存在 `pwmfan`、`fan1_input`、`pwm1`
+这些 sysfs 节点，就可以直接安装使用；如果节点不存在，插件会安装成功但无法控制风扇。
+
 滚动构建包跟随 `main` 分支，适合尝鲜；长期稳定使用建议优先选择带版本号的
 正式 Release。
 
